@@ -1,4 +1,4 @@
-# mke_neighborhood_property_value_analysis
+# MKE neighborhood property value analysis
 
 This project uses Python and R to examine what variables influence median single-family property values of Milwaukee census tracts. It then seeks to compare a model's predicted value for a given tract to its actual value to get a sense of what neighborhood might be considered undervalued or overvalued. Although imperfect, city appraisal data is used for home values because it is the most comprehensive, publicly available dataset for all homes in Milwaukee. It also comes with the benefit of identifying a home's Census tract, which makes it easy to join with Census economic and demographic data as a well the police department's crime data.
 

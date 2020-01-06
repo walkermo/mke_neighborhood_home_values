@@ -1,0 +1,249 @@
+---
+title: "MKE neighborhood home value analysis"
+output: html_document
+---
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Overview
+#### The objective of this analysis is twofold:
+* Creating a regression model with high prediction accuracy (using adjusted R-squared while minimizing AIC), then using the residuals from the model to identify neighborhoods that could be considered undervalued. The goal of this model is precision, and it's not focused on the identifying the extent to which individual features are influential.
+* Creating a simpler model that does account for multicolinearity, so as to get a better sense of which individual features are most influential.
+
+### Load libraries
+
+```{r warning=F, message=F}
+library(dplyr)
+library(data.table)
+library(leaflet)
+library(car)
+library(RColorBrewer)
+library(geojsonio)
+library(sp)
+library(pedometrics)
+library(leafsync)
+```
+
+### Load data
+``` {r }
+knitr::opts_knit$set(root.dir = normalizePath("../analysis/data/"))
+path <- knitr::opts_knit$get("root.dir")
+df <- read.csv(paste0(path, '/final_data.csv'))
+```
+
+
+### Preview the data
+```{r}
+head(df[order(df$num_props),])
+
+### Four of these tracts have a single digit number of properties, and including
+### some of them in initial models (particularly the outlier wiht a median value
+### of $863K) was influencing the model, so let's remove them
+df <- df[df$num_props > 10,]
+```
+
+### Exploring relationships with median value
+```{r, fig.width=10, fig.height=20} 
+### visualize the relationships to get a better sense of the relationship of 
+### each variable with median value
+par(mfrow=c(8, 3), mar=c(2,2,2,2))
+y <- df$median_value
+
+for (i in 4:26)
+{
+  title <- colnames(df[i])
+  plot(df[,i], y, main=title, xlab=title, ylab='median value')
+  abline(lm(y~df[,i]), col='red')
+}
+```
+
+```{r}
+### In looking at the above plots, vacancy, homicide and violent crime have a clear,
+### negative relationship with home values, but only up to a certain point, so we'll
+### experiment with creating log versions of those fields
+## Because the log transformations can create Inf values, we'll first set fields with
+## values of zero to be negligibly positive
+df$vacant[df$vacant== 0] <- .0001
+df$vacLog <- log(df$vacant)
+
+### because homicides and "other" violent crime are closely correlated and have very
+### similar relationships with median home value, let's simplify this by combining
+### them into one field
+df$violentCrime <- df$Homicide + df$other_violent_crime
+df$violentCrime[df$violentCrime== 0] <- .0001
+df$violentCrimeLog <- log(df$violentCrime)
+
+
+## Do the log versions of these fields have a stronger relationship with home values? Yes.
+sprintf("vacancy: %s; vacLog: %s", cor(df$vacant, df$median_value)[1],
+        cor(df$vacLog, df$median_value)[1])
+sprintf("violent crime: %s; log violent crime: %s", cor(df$violentCrime, df$median_value)[1],
+        cor(df$violentCrimeLog, df$median_value)[1])
+```
+``` {r}
+### let's look at correlations bewteen median value and potential features
+cors <- sort(cor(df[3:29])[,1], decreasing=TRUE)
+cors
+```
+
+#### After testing a variety of combinations of different terms and their interactions, below is my initial model (focused on prediction accuracy)
+```{r}
+mod1 <- lm(median_value~BLDG_AREA+BATHS+pct_coll_plus+pct_white
+                +vacLog+pct_black+garage+BEDROOMS+property_crime+I(BATHS*BLDG_AREA)
+                +I(BATHS*BEDROOMS)+I(BLDG_AREA*BEDROOMS)
+                +I(pct_black*pct_coll_plus)+I(pct_black*vacLog)
+                +I(pct_white*property_crime)+violentCrimeLog
+                +I(pct_black*violentCrimeLog)
+                , data = df)
+
+summary(mod1)
+sprintf('AIC: %s', AIC(mod1))
+
+
+### The residuals are normally distributed, and it doesn't look like
+### any of the observations are too influential
+hist(resid(mod1))
+
+par(mfrow=c(2,2))
+plot(mod1)
+
+### add predicted values and residuals to the df so that we can visualize them
+df$preds = round(predict(mod1), 0)
+df$residuals = round(resid(mod1), 0)
+```
+
+## Visualize residuals
+```{r, warning=F, fig.width=10, fig.height=10}
+### navigate to geo folder
+knitr::opts_knit$set(root.dir = normalizePath('../../geo/'))
+# knitr::opts_knit$set(root.dir = normalizePath('../geo/'))
+geo_path <- knitr::opts_knit$get("root.dir")
+
+tracts <- geojson_read(paste0(geo_path, '/mke_county_tract.geojson'), what = "sp")
+
+### merge df and geo obj, inner join only
+tracts_df <- merge(tracts, df, by='GEOID', all=FALSE)
+ 
+m1Bins <- c(min(tracts_df$residuals), -35000, -25000, -15000, -5000, 5000,
+          15000, 25000, 35000, max(tracts_df$residuals))
+m1Pal <- colorBin('RdYlGn', domain = tracts_df$residuals, bins = m1Bins, reverse = TRUE)
+
+### Create labels for hovering
+m1Labels <- sprintf(
+          '<strong> %s</strong><br/>Expected value: <strong>$%g</strong><br/>
+          Actual value: <strong>$%g</strong><br/>Difference: <strong>$%g</strong>',
+          tracts_df$NAMELSAD, tracts_df$preds,
+          tracts_df$median_value, tracts_df$residuals
+) %>% lapply(htmltools::HTML)
+
+m1 <- leaflet(tracts_df) %>%
+  setView(lat=43.060174, lng=-87.925549, zoom = 11) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~m1Pal(tracts_df$residuals),
+    weight = 1,
+    color = 'white',
+    opacity = 0.75,
+    fillOpacity = 0.75,
+    ### add hover-over capability
+    highlight = highlightOptions(
+    weight = 5,
+    color = "#666",
+    fillOpacity = 0.7,
+    bringToFront = TRUE),
+  ### adding labels for hover tool
+  label = m1Labels,
+  labelOptions = labelOptions(
+    style = list("font-weight" = "normal", padding = "3px 8px"),
+    textsize = "11px",
+    direction = "auto")
+  ) %>%
+  ### add legend
+  addLegend(pal = m1Pal, values = ~density, opacity = 0.7,
+            title = 'Expected minus<br>Actual Value',
+            position = "topright")
+
+### map for actual values only
+m2Bins <- c(min(tracts_df$median_value), 30000, 60000, 90000, 120000, 150000,
+          180000, 210000, 240000, max(tracts_df$median_value))
+m2Ppal <- colorBin('Blues', domain = tracts_df$median_value, bins = m2Bins)
+
+### Create labels for hovering
+m2Labels <- sprintf(
+          '<strong> %s</strong><br/>Median value: <strong>$%g</strong>',
+          tracts_df$NAMELSAD,tracts_df$median_value
+        ) %>% lapply(htmltools::HTML)
+
+m2 <- leaflet(tracts_df) %>%
+  setView(lat=43.060174, lng=-87.925549, zoom = 11) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~m2Ppal(tracts_df$median_value),
+    weight = 1,
+    color = 'white',
+    opacity = 0.75,
+    fillOpacity = 0.75,
+    ### add hover-over capability
+    highlight = highlightOptions(
+    weight = 5,
+    color = "#666",
+    fillOpacity = 0.7,
+    bringToFront = TRUE),
+  ### adding labels for hover tool
+  label = m2Labels,
+  labelOptions = labelOptions(
+    style = list("font-weight" = "normal", padding = "3px 8px"),
+    textsize = "11px",
+    direction = "auto")
+  ) %>%
+  ### add legend
+  addLegend(pal = m2Ppal, values = ~density, opacity = 0.7,
+            title = 'Median value',
+            position = "topright")
+```
+In the below plots, we can see that one neighborhood on the west side of the city really stands out for having an actual median value that is nearly $50K below what the model expects the value to be. Hover over neighborhoods for details.
+
+```{r}
+latticeview(m1, m2, ncol=2)
+```
+
+\s
+#### Model #2 (Simpler appraoch focused on understanding influence of individual variables)
+```{r}
+### To be able to make comparisons between different variables, first scale the data
+### (excluding GEOID and median value)
+scaled <- as.data.frame(scale(subset(df, select=-c(GEOID, median_value))))
+
+### join back in geo and median val cols
+scaled <- cbind(subset(df, select=c(GEOID, median_value)), scaled)
+
+### final simple model
+mod2 <- lm(median_value~BATHS+median_hh_income+pct_black+
+                      pct_coll_plus+property_crime+vacLog,
+                      data = scaled)
+
+summary(mod2)
+
+### And we can see that multicolinearity is fairly low
+vif(mod2)
+
+## residuals are normally distributed, though there are a few on the low end that stand out
+hist(resid(mod2))
+
+## no obvservations are too skewed or are having too much influence over the model
+par(mfrow = c(2,2))
+plot(mod2)
+```
+
+In the below plot, which shows the influence of each variable in the model, we can see that the average number of bathrooms -- which it's worth noting is strongly correlated with average home size, lot size and the average number of bedrooms -- has the greatest influence on average home values in a neighborhood. The model also finds that even when controlling for several other factors, neighborhoods with larger black populations have lower property values, though the influence of that variable is smaller than most other variables. And while it's hard to imagine that other fields, such as say, violent crime, don't have a significant effect on property values, the effect of them is difficult to interpret because adding them quickly produces high multicolinearity within the model. 
+```{r fig.width=6, fig.height=4}
+par(mar = c(4,6,1,1))
+barplot(sort(coef(mod2)[2:7]), xlab = 'Coefficients',
+        horiz = T, las=2, col='blue',
+        names.arg=c("Vacancy", "% Black", "Prop Crime", "Income",
+        "% Coll. deg.", "Baths"))
+abline(v=0)
+```
